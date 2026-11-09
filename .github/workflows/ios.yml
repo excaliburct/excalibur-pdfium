@@ -1,0 +1,124 @@
+# The PDF engine for Excalibur View's iPad and iPhone app, built for iOS 15 and later.
+# WHAT: bblanchon/pdfium-binaries' own build steps, at the exact commit of the release View used until now
+#       (chromium/8066), with one change: the iOS deployment target 15.0 instead of their 17.0.
+# WHY:  their prebuilt engine is what held View at iOS 17; the shop's older iPads run 15 and 16.
+name: PDFium for iOS 15
+
+on:
+  workflow_dispatch:   # WHAT: run by hand. WHY: a new engine is a deliberate step, pinned in View by its SHA-256
+  push:
+    tags: ["chromium/*-ios15*"]   # WHAT: a tag makes a release. WHY: View downloads from a release, never a branch
+
+permissions: {}   # WHAT: nothing by default. WHY: each job asks only for what it needs
+
+env:
+  UPSTREAM: bblanchon/pdfium-binaries                         # WHAT: the build scripts' home. WHY: the same scripts that made the engine View used
+  UPSTREAM_SHA: f2e9a1c45bb17b85b540abf1af30146ef65416ac      # WHAT: their chromium/8066 release commit. WHY: the same source, nothing newer slips in
+  PDFium_BRANCH: chromium/8066                                # WHAT: the PDFium branch. WHY: the engine version View ships now
+  PDFium_VERSION: "8066"                                      # WHAT: the version stamped in the package. WHY: says what it is
+  MIN_IOS: "15.0"                                             # WHAT: the oldest iOS it runs on. WHY: Apple's floor for App Store builds with Xcode 26
+
+jobs:
+  build:
+    name: Build (${{ matrix.environment }}-arm64)
+    runs-on: macos-15   # WHAT: GitHub's Mac. WHY: iOS builds need Xcode; nobody's Mac is needed
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        environment: [device, simulator]   # WHAT: iPads and iPhones, and Xcode's simulator. WHY: the two slices View's build packs
+    env:
+      PDFium_TARGET_OS: ios
+      PDFium_TARGET_CPU: arm64
+      PDFium_TARGET_ENVIRONMENT: ${{ matrix.environment }}
+      PDFium_ENABLE_V8: "false"
+      PDFium_BUILD_TYPE: shared
+      PDFium_IS_DEBUG: "false"
+    steps:
+      - name: Check out the build scripts at the pinned commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803   # v6.1.0
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ env.UPSTREAM_SHA }}
+          persist-credentials: false
+      - name: Set the iOS minimum to 15.0 (the one change)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(grep -c 'ios_deployment_target = \"17.0\"' steps/05-configure.sh)" = 1   # WHAT: exactly the line we change. WHY: if upstream moved it, stop rather than build the wrong thing
+          sed -i '' "s/ios_deployment_target = \"17.0\"/ios_deployment_target = \"$MIN_IOS\"/" steps/05-configure.sh
+          grep -n 'ios_deployment_target' steps/05-configure.sh
+      - name: Environment
+        run: steps/00-environment.sh
+        shell: bash
+      - name: Install (1/2)
+        run: steps/01-install.sh
+        shell: bash
+      - name: Check out PDFium
+        run: steps/02-checkout.sh
+        shell: bash
+        timeout-minutes: 30
+      - name: Patches
+        run: steps/03-patch.sh
+        shell: bash
+      - name: Install (2/2)
+        run: steps/04-install-extras.sh
+        shell: bash
+      - name: Configure
+        run: steps/05-configure.sh && cat pdfium/out/args.gn
+        shell: bash
+      - name: Build
+        run: steps/06-build.sh
+        shell: bash
+      - name: Stage
+        run: steps/07-stage.sh
+        shell: bash
+      - name: Licences
+        run: steps/08-licenses.sh
+        shell: bash
+      - name: Check it really runs on iOS 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          lib=staging/lib/libpdfium.dylib
+          vtool -show-build "$lib" | tee build.txt
+          grep -Eq "minos ${MIN_IOS}$" build.txt   # WHAT: the minimum the library says. WHY: the whole point of this build
+      - name: Pack
+        run: steps/10-pack.sh
+        shell: bash
+      - name: Fingerprint
+        shell: bash
+        run: shasum -a 256 pdfium-ios-${{ matrix.environment }}-arm64.tgz | tee pdfium-ios-${{ matrix.environment }}-arm64.tgz.sha256
+      - name: Keep it
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f   # v6.0.0
+        with:
+          name: pdfium-ios-${{ matrix.environment }}-arm64
+          path: |
+            pdfium-ios-${{ matrix.environment }}-arm64.tgz
+            pdfium-ios-${{ matrix.environment }}-arm64.tgz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')   # WHAT: only for a tag. WHY: a hand run just builds and keeps
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # WHAT: may make this repository's release. WHY: View downloads from it
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53   # v6.0.0
+        with:
+          path: out
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat out/*.sha256 > out/SHA256SUMS.txt
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "PDFium $TAG" \
+            --notes "PDFium $PDFium_BRANCH for iOS $MIN_IOS and later (device and simulator, arm64), built with bblanchon/pdfium-binaries at $UPSTREAM_SHA with only the iOS minimum changed." \
+            out/*.tgz out/SHA256SUMS.txt
